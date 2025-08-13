@@ -152,108 +152,22 @@ class Exp_Classification(Exp_Basic):
                     print(f"Parent directory '{parent_dir}' exists, but 'checkpoint.pth' is missing.")
                 raise FileNotFoundError("Model checkpoint not found at calculated or fallback path: %s" % model_path)
 
+        # REMOVED: Architecture inference logic
+        # We now rely on the args passed from ml_runner.py to be correct
+        print(f"🔍 Using provided architecture parameters:")
+        print(f"   seq_len: {self.args.seq_len}")
+        print(f"   d_model: {self.args.d_model}")
+        print(f"   e_layers: {self.args.e_layers}")
+        print(f"   num_class: {self.args.num_class}")
+        print(f"   enc_in: {self.args.enc_in}")
+        print(f"   patch_len_list: {getattr(self.args, 'patch_len_list', 'N/A')}")
+        print(f"   up_dim_list: {getattr(self.args, 'up_dim_list', 'N/A')}")
+
         # Load model weights
         print(f"Loading model state from {model_path} onto device: {device}")
         use_swa = hasattr(self, 'swa') and self.swa and self.swa_model is not None
 
         try:
-            # Inspect checkpoint to align model architecture if possible
-            try:
-                raw_for_shape = torch.load(model_path, map_location='cpu')
-                state_like = raw_for_shape
-                if isinstance(raw_for_shape, dict):
-                    for key in ['state_dict', 'model_state_dict', 'model']:
-                        if key in raw_for_shape and isinstance(raw_for_shape[key], dict):
-                            state_like = raw_for_shape[key]
-                            break
-                if isinstance(state_like, dict):
-                    # Normalize keys (strip DataParallel prefix) for architecture inference
-                    state_scan = {}
-                    for k, v in state_like.items():
-                        nk = k
-                        if nk.startswith('module.'):
-                            nk = nk.replace('module.', '', 1)
-                        state_scan[nk] = v
-                    # Infer seq_len from fc weights in channel embedding
-                    seq_len_inferred = None
-                    d_model_inferred = None
-                    patch_len_list_inferred = []
-                    up_dim_list_inferred = []
-                    # d_model from temporal tokenConv out_channels
-                    for k, v in state_scan.items():
-                        if 'enc_embedding.value_embeddings_t.0.tokenConv.weight' in k and isinstance(v, torch.Tensor):
-                            d_model_inferred = int(v.shape[0])
-                            break
-                    # seq_len and up_dim list
-                    for k, v in state_scan.items():
-                        if 'enc_embedding.value_embeddings_c.0.fc.weight' in k and isinstance(v, torch.Tensor):
-                            # shape [d_model, seq_len]
-                            seq_len_inferred = int(v.shape[1])
-                            break
-                    # patch_len_list from temporal tokenConv kernel width
-                    i = 0
-                    while f'enc_embedding.value_embeddings_t.{i}.tokenConv.weight' in state_scan:
-                        w = state_scan[f'enc_embedding.value_embeddings_t.{i}.tokenConv.weight']
-                        if isinstance(w, torch.Tensor) and w.ndim == 4:
-                            patch_len_list_inferred.append(int(w.shape[3]))
-                        i += 1
-                    # up_dim_list from channel tokenConv out_channels
-                    j = 0
-                    while f'enc_embedding.value_embeddings_c.{j}.tokenConv.weight' in state_scan:
-                        w = state_scan[f'enc_embedding.value_embeddings_c.{j}.tokenConv.weight']
-                        if isinstance(w, torch.Tensor) and w.ndim == 3:
-                            up_dim_list_inferred.append(int(w.shape[0]))
-                        j += 1
-                    # e_layers from encoder layer count
-                    max_layer_idx = -1
-                    for k in state_scan.keys():
-                        if k.startswith('encoder.attn_layers.'):
-                            try:
-                                idx = int(k.split('.')[2])
-                                if idx > max_layer_idx:
-                                    max_layer_idx = idx
-                            except Exception:
-                                pass
-                    e_layers_inferred = max_layer_idx + 1 if max_layer_idx >= 0 else None
-
-                    args_changed = False
-                    if seq_len_inferred and getattr(self.args, 'seq_len', None) != seq_len_inferred:
-                        print(f"Adjusting seq_len from {getattr(self.args,'seq_len',None)} to {seq_len_inferred} based on checkpoint")
-                        self.args.seq_len = seq_len_inferred
-                        args_changed = True
-                    if d_model_inferred and getattr(self.args, 'd_model', None) != d_model_inferred:
-                        print(f"Adjusting d_model from {getattr(self.args,'d_model',None)} to {d_model_inferred} based on checkpoint")
-                        self.args.d_model = d_model_inferred
-                        args_changed = True
-                    if patch_len_list_inferred and getattr(self.args, 'patch_len_list', None) != ','.join(map(str, patch_len_list_inferred)):
-                        self.args.patch_len_list = ','.join(map(str, patch_len_list_inferred))
-                        print(f"Adjusting patch_len_list to {self.args.patch_len_list} based on checkpoint")
-                        args_changed = True
-                    if up_dim_list_inferred and getattr(self.args, 'up_dim_list', None) != ','.join(map(str, up_dim_list_inferred)):
-                        self.args.up_dim_list = ','.join(map(str, up_dim_list_inferred))
-                        print(f"Adjusting up_dim_list to {self.args.up_dim_list} based on checkpoint")
-                        args_changed = True
-                    if e_layers_inferred and getattr(self.args, 'e_layers', None) != e_layers_inferred:
-                        print(f"Adjusting e_layers from {getattr(self.args,'e_layers',None)} to {e_layers_inferred} based on checkpoint")
-                        self.args.e_layers = e_layers_inferred
-                        args_changed = True
-                    # Derive feature toggles
-                    self.args.no_temporal_block = len(patch_len_list_inferred) == 0
-                    self.args.no_channel_block = len(up_dim_list_inferred) == 0
-                    # If architecture changed, rebuild model
-                    if args_changed:
-                        print("Rebuilding model to match checkpoint architecture...")
-                        self.model = self._build_model().to(device)
-                        if use_swa and self.swa_model is not None:
-                            self.swa_model = optim.swa_utils.AveragedModel(self.model)
-                    # Log effective architecture
-                    try:
-                        print(f"Effective architecture → seq_len={self.args.seq_len}, d_model={self.args.d_model}, e_layers={self.args.e_layers}, patch_len_list={self.args.patch_len_list}, up_dim_list={self.args.up_dim_list}")
-                    except Exception:
-                        pass
-            except Exception as arch_infer_err:
-                print(f"Could not infer architecture from checkpoint: {arch_infer_err}")
-
             def _load_state_dict_safely(target_model, checkpoint_path, device):
                 raw = torch.load(checkpoint_path, map_location=device)
                 state_dict_candidate = raw
@@ -262,14 +176,24 @@ class Exp_Classification(Exp_Basic):
                         if key in raw and isinstance(raw[key], dict):
                             state_dict_candidate = raw[key]
                             break
+                
                 # Strip DataParallel 'module.' prefix if present
                 if isinstance(state_dict_candidate, dict) and any(k.startswith('module.') for k in state_dict_candidate.keys()):
                     state_dict_candidate = {k.replace('module.', '', 1): v for k, v in state_dict_candidate.items()}
+                
+                # Log what we're loading
+                print(f"🔍 Checkpoint contains {len(state_dict_candidate)} parameters")
+                
                 # First attempt strict load, then fallback to non-strict
                 try:
                     missing, unexpected = target_model.load_state_dict(state_dict_candidate, strict=True)
-                    if isinstance(missing, list) and isinstance(unexpected, list) and (missing or unexpected):
-                        print(f"Warning: Strict load reported missing={len(missing)}, unexpected={len(unexpected)}. Proceeding.")
+                    if isinstance(missing, list) and isinstance(unexpected, list):
+                        if missing:
+                            print(f"⚠️ Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+                        if unexpected:
+                            print(f"⚠️ Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+                        if missing or unexpected:
+                            print(f"Warning: Strict load reported missing={len(missing)}, unexpected={len(unexpected)}. Proceeding.")
                 except Exception as strict_err:
                     print(f"Strict load_state_dict failed: {strict_err}. Trying non-strict load.")
                     try:
@@ -282,6 +206,8 @@ class Exp_Classification(Exp_Basic):
                         filtered = {k: v for k, v in state_dict_candidate.items() if k in model_sd and getattr(model_sd[k], 'shape', None) == getattr(v, 'shape', None)}
                         dropped = [k for k in state_dict_candidate.keys() if k not in filtered]
                         print(f"Filtered checkpoint params: kept={len(filtered)}, dropped={len(dropped)} due to shape/key mismatch.")
+                        if dropped:
+                            print(f"Dropped keys (first 10): {dropped[:10]}")
                         target_model.load_state_dict(filtered, strict=False)
 
             if use_swa:
@@ -299,6 +225,13 @@ class Exp_Classification(Exp_Basic):
                 self.model.eval()
                 model_to_use = self.model
                 print("Using standard model weights for prediction.")
+
+            # Debug: Check final layer dimensions
+            print("🔍 Checking model output layer dimensions...")
+            for name, module in model_to_use.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    print(f"   Linear layer '{name}': {module.in_features} -> {module.out_features}")
+                    
         except Exception as load_err:
             print(f"Error loading model state dict from {model_path}: {load_err}")
             traceback.print_exc()
@@ -335,7 +268,7 @@ class Exp_Classification(Exp_Basic):
              print("Warning: Model's expected seq_len or enc_in not found in args. Skipping shape validation.")
         else:
             if seq_len_data != expected_seq_len:
-                print(f"Warning: Input sequence length {seq_len_data} != expected {expected_seq_len}.")
+                print(f"⚠️ Warning: Input sequence length {seq_len_data} != expected {expected_seq_len}.")
             if channels_data != expected_channels:
                 raise ValueError(f"Input data has {channels_data} channels, model expects {expected_channels}.")
 
@@ -343,6 +276,14 @@ class Exp_Classification(Exp_Basic):
 
         # Convert to tensor
         X_tensor = torch.tensor(X_batch, dtype=torch.float32).to(device)
+        
+        # Debug input data
+        print(f"🔍 Input tensor stats:")
+        print(f"   Shape: {X_tensor.shape}")
+        print(f"   Mean: {X_tensor.mean():.4f}, Std: {X_tensor.std():.4f}")
+        print(f"   Min: {X_tensor.min():.4f}, Max: {X_tensor.max():.4f}")
+        print(f"   Has NaN: {torch.isnan(X_tensor).any()}")
+        print(f"   Has Inf: {torch.isinf(X_tensor).any()}")
 
         # Inference
         all_predictions = []
@@ -359,12 +300,25 @@ class Exp_Classification(Exp_Basic):
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
+                # Debug raw outputs
+                print(f"🔍 Raw model outputs:")
+                print(f"   Shape: {outputs.shape}")
+                print(f"   Sample (first trial): {outputs[0] if outputs.dim() > 1 else outputs}")
+                print(f"   Min/Max: {outputs.min().item():.4f}/{outputs.max().item():.4f}")
+
                 # If outputs are sequence logits, average over sequence length
                 if outputs.dim() == 3:
                     outputs = outputs.mean(dim=1)  # shape -> [batch_size, num_classes]
+                    print(f"🔍 After averaging over sequence: {outputs.shape}")
+
+                # Verify output dimensions match expected classes
+                if outputs.shape[-1] != self.args.num_class:
+                    raise ValueError(f"❌ CRITICAL: Model outputs {outputs.shape[-1]} classes, but args.num_class={self.args.num_class}")
 
                 probs = torch.nn.functional.softmax(outputs, dim=-1)
                 num_classes = probs.shape[-1]
+                
+                print(f"🔍 After softmax - first trial probabilities: {probs[0]}")
 
                 predictions = torch.argmax(probs, dim=-1)  # one prediction per trial
                 all_predictions = predictions.cpu().numpy()
@@ -387,7 +341,6 @@ class Exp_Classification(Exp_Basic):
         # Majority vote and metrics
         majority_prediction = int(np.bincount(all_predictions).argmax()) if len(all_predictions) > 0 else -1
         consistency_metrics = {"error": "Calculation failed or not applicable"}
-
 
         if num_trials > 0 and len(all_predictions) == num_trials:
             try:
