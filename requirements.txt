@@ -1,0 +1,26 @@
+# Web & API
+Flask==2.3.3
+Flask-Cors==4.0.0
+gunicorn==21.2.0
+python-dotenv==1.0.0
+
+# Background Tasks
+celery==5.4.0
+redis==5.0.7
+
+# Database
+supabase==1.0.3
+
+# Machine Learning & Data
+numpy==1.23.5
+pandas==1.5.3
+scikit-learn==1.2.2
+matplotlib==3.7.0
+scipy
+dtaidistance
+torch==2.1.0
+
+# Utilities
+fpdf2==2.7.9
+tqdm==4.64.1
+natsort==8.4.0
